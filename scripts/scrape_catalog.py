@@ -1,0 +1,566 @@
+"""
+SHL Product Catalog Scraper
+============================
+Scrapes Individual Test Solutions from:
+https://www.shl.com/solutions/products/product-catalog/
+
+Saves results to data/shl_catalog.json
+
+Usage:
+    python scripts/scrape_catalog.py
+"""
+
+import json
+import time
+import re
+import httpx
+from bs4 import BeautifulSoup
+from pathlib import Path
+from typing import Optional
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+
+BASE_URL = "https://www.shl.com"
+CATALOG_URL = "https://www.shl.com/solutions/products/product-catalog/"
+OUTPUT_PATH = Path(__file__).parent.parent / "data" / "shl_catalog.json"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+}
+
+# SHL test type code → full name mapping
+TEST_TYPE_MAP = {
+    "A": "Ability & Aptitude",
+    "B": "Biodata & Situational Judgement",
+    "C": "Competencies",
+    "D": "Development & 360",
+    "E": "Assessment Exercises",
+    "K": "Knowledge & Skills",
+    "M": "Motivational",
+    "P": "Personality & Behavior",
+    "S": "Simulations",
+}
+
+
+def get_page(url: str, client: httpx.Client, retries: int = 3) -> Optional[BeautifulSoup]:
+    """Fetch a page and return parsed BeautifulSoup, with retries."""
+    for attempt in range(retries):
+        try:
+            resp = client.get(url, headers=HEADERS, timeout=30, follow_redirects=True)
+            resp.raise_for_status()
+            return BeautifulSoup(resp.text, "lxml")
+        except Exception as e:
+            log.warning(f"Attempt {attempt + 1} failed for {url}: {e}")
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)
+    return None
+
+
+def parse_test_types(soup: BeautifulSoup) -> list[str]:
+    """Extract test type codes from a product page."""
+    types = []
+    # Look for test type indicators on the page
+    for tag in soup.find_all(class_=re.compile(r"test.type|product.type", re.I)):
+        text = tag.get_text(strip=True)
+        for code in TEST_TYPE_MAP:
+            if code in text or TEST_TYPE_MAP[code].lower() in text.lower():
+                if code not in types:
+                    types.append(code)
+    return types or ["K"]  # Default to Knowledge if not found
+
+
+def parse_duration(soup: BeautifulSoup) -> Optional[str]:
+    """Extract test duration from product page."""
+    # Try common patterns
+    patterns = [
+        re.compile(r"(\d+)\s*(?:–|-)\s*(\d+)\s*minutes?", re.I),
+        re.compile(r"(\d+)\s*minutes?", re.I),
+        re.compile(r"approximately\s+(\d+)", re.I),
+    ]
+    full_text = soup.get_text(" ")
+    for pat in patterns:
+        m = pat.search(full_text)
+        if m:
+            return m.group(0).strip()
+    return None
+
+
+def parse_skills(soup: BeautifulSoup, name: str) -> list[str]:
+    """Extract skills measured from product page or infer from name."""
+    skills = []
+
+    # Look for skills sections
+    for heading in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
+        text = heading.get_text(strip=True).lower()
+        if any(kw in text for kw in ["measures", "skills", "assesses", "competencies"]):
+            # Get next sibling content
+            sibling = heading.find_next_sibling()
+            if sibling:
+                if sibling.name in ["ul", "ol"]:
+                    skills = [li.get_text(strip=True) for li in sibling.find_all("li")]
+                else:
+                    raw = sibling.get_text(strip=True)
+                    skills = [s.strip() for s in re.split(r"[,;•·\n]", raw) if s.strip()]
+            break
+
+    # Cap at 10 skills
+    return skills[:10]
+
+
+def parse_description(soup: BeautifulSoup) -> str:
+    """Extract the primary description from a product page."""
+    # Try meta description first (often the cleanest)
+    meta = soup.find("meta", attrs={"name": "description"})
+    if meta and meta.get("content"):
+        return meta["content"].strip()
+
+    # Try main content area
+    for sel in [".product-description", ".hero__text", ".entry-content p", "main p"]:
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(strip=True)
+            if len(text) > 50:
+                return text
+
+    return "SHL assessment tool."
+
+
+def scrape_catalog_page(client: httpx.Client) -> list[dict]:
+    """
+    Scrape the main catalog page to get all Individual Test Solutions.
+    Returns list of {name, url, test_type, category} dicts.
+    """
+    log.info(f"Fetching catalog: {CATALOG_URL}")
+    soup = get_page(CATALOG_URL, client)
+    if not soup:
+        log.error("Failed to load catalog page")
+        return []
+
+    products = []
+
+    # The catalog uses a table/grid structure — find all product links
+    # SHL renders products in a custom table with data attributes
+    catalog_container = soup.find("div", class_=re.compile(r"catalog|product-list|solutions", re.I))
+
+    # Fallback: find all links pointing to product detail pages
+    all_links = soup.find_all("a", href=re.compile(r"/solutions/products/product-catalog/view/"))
+
+    seen_urls = set()
+    for link in all_links:
+        href = link.get("href", "")
+        if not href or href in seen_urls:
+            continue
+        seen_urls.add(href)
+
+        name = link.get_text(strip=True)
+        if not name or len(name) < 3:
+            # Try parent element text
+            parent = link.parent
+            if parent:
+                name = parent.get_text(strip=True)[:100]
+
+        full_url = href if href.startswith("http") else BASE_URL + href
+
+        # Determine test type from page context (row/nearby elements)
+        row = link.find_parent("tr") or link.find_parent("li") or link.find_parent("div")
+        test_type = "K"
+        category = "Individual Test"
+
+        if row:
+            row_text = row.get_text(" ")
+            for code, label in TEST_TYPE_MAP.items():
+                if code in row_text or label.lower() in row_text.lower():
+                    test_type = code
+                    break
+
+        products.append({
+            "name": name.strip(),
+            "url": full_url,
+            "test_type": test_type,
+            "category": category,
+        })
+        log.debug(f"Found: {name} → {test_type}")
+
+    log.info(f"Found {len(products)} product links on catalog page")
+    return products
+
+
+def enrich_product(product: dict, client: httpx.Client) -> dict:
+    """Fetch individual product page and enrich with description, skills, duration."""
+    url = product["url"]
+    log.info(f"Enriching: {product['name']}")
+
+    soup = get_page(url, client)
+    if not soup:
+        log.warning(f"Could not fetch {url}, using defaults")
+        product["description"] = f"SHL {product['name']} assessment."
+        product["skills_measured"] = []
+        product["duration"] = None
+        product["languages"] = []
+        product["test_type_full"] = TEST_TYPE_MAP.get(product["test_type"], "Knowledge & Skills")
+        return product
+
+    product["description"] = parse_description(soup)
+    product["skills_measured"] = parse_skills(soup, product["name"])
+    product["duration"] = parse_duration(soup)
+    product["test_type_full"] = TEST_TYPE_MAP.get(product["test_type"], "Knowledge & Skills")
+
+    # Extract languages if mentioned
+    lang_section = soup.find(string=re.compile(r"available in", re.I))
+    product["languages"] = []
+    if lang_section:
+        parent = lang_section.parent if lang_section else None
+        if parent:
+            langs = re.findall(r"\b[A-Z][a-z]+(?:\s[A-Z][a-z]+)?\b", parent.get_text())
+            product["languages"] = langs[:10]
+
+    time.sleep(0.5)  # Polite delay
+    return product
+
+
+def get_fallback_catalog() -> list[dict]:
+    """
+    Returns a curated list of well-known SHL Individual Test Solutions.
+    Used as fallback when scraping is unavailable.
+    """
+    return [
+        {
+            "name": "Verify Interactive - Numerical Reasoning",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/verify-interactive-numerical-reasoning/",
+            "description": "Measures numerical reasoning ability through interactive, realistic workplace scenarios. Assesses ability to analyse numerical data, draw conclusions and make decisions.",
+            "test_type": "A",
+            "test_type_full": "Ability & Aptitude",
+            "skills_measured": ["Numerical reasoning", "Data analysis", "Decision making", "Mathematical interpretation"],
+            "duration": "17-25 minutes",
+            "category": "Cognitive Ability",
+            "languages": ["English", "French", "German", "Spanish"],
+        },
+        {
+            "name": "Verify Interactive - Verbal Reasoning",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/verify-interactive-verbal-reasoning/",
+            "description": "Measures verbal reasoning ability through interactive scenarios. Assesses ability to evaluate written information, draw logical conclusions and make sound judgements.",
+            "test_type": "A",
+            "test_type_full": "Ability & Aptitude",
+            "skills_measured": ["Verbal reasoning", "Reading comprehension", "Critical thinking", "Logical deduction"],
+            "duration": "17-19 minutes",
+            "category": "Cognitive Ability",
+            "languages": ["English", "French", "German"],
+        },
+        {
+            "name": "Verify Interactive - Inductive Reasoning",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/verify-interactive-inductive-reasoning/",
+            "description": "Measures inductive reasoning (abstract reasoning) through pattern recognition tasks. Assesses ability to identify patterns, rules and relationships in non-verbal information.",
+            "test_type": "A",
+            "test_type_full": "Ability & Aptitude",
+            "skills_measured": ["Abstract reasoning", "Pattern recognition", "Logical thinking", "Problem solving"],
+            "duration": "24 minutes",
+            "category": "Cognitive Ability",
+            "languages": ["English"],
+        },
+        {
+            "name": "OPQ32r",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/opq32r/",
+            "description": "The Occupational Personality Questionnaire (OPQ32r) measures 32 personality characteristics important for work performance. Provides rich insight into how an individual prefers to work and interact with others.",
+            "test_type": "P",
+            "test_type_full": "Personality & Behavior",
+            "skills_measured": ["Relationships with people", "Thinking style", "Feelings and emotions", "Leadership potential", "Team working"],
+            "duration": "25-35 minutes",
+            "category": "Personality",
+            "languages": ["English", "French", "German", "Spanish", "Dutch", "Chinese"],
+        },
+        {
+            "name": "Motivation Questionnaire (MQ)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/motivation-questionnaire/",
+            "description": "Assesses 18 factors that influence an individual's motivation at work including energy and dynamism, commercial outlook, achievement, and personal development.",
+            "test_type": "M",
+            "test_type_full": "Motivational",
+            "skills_measured": ["Energy and dynamism", "Commercial outlook", "Achievement motivation", "Recognition", "Personal growth"],
+            "duration": "25 minutes",
+            "category": "Motivation",
+            "languages": ["English", "French"],
+        },
+        {
+            "name": "Java 8 (New)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/java-8-new/",
+            "description": "Assesses core Java 8 programming skills including object-oriented programming, Java collections, streams, lambdas, and exception handling.",
+            "test_type": "K",
+            "test_type_full": "Knowledge & Skills",
+            "skills_measured": ["Java OOP", "Java collections", "Lambda expressions", "Stream API", "Exception handling", "Generics"],
+            "duration": "45 minutes",
+            "category": "Technology - Programming",
+            "languages": ["English"],
+        },
+        {
+            "name": "Python (New)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/python-new/",
+            "description": "Evaluates Python programming knowledge including data structures, functions, OOP, standard libraries, and Pythonic coding practices.",
+            "test_type": "K",
+            "test_type_full": "Knowledge & Skills",
+            "skills_measured": ["Python syntax", "Data structures", "Functions", "OOP in Python", "Standard libraries", "Error handling"],
+            "duration": "45 minutes",
+            "category": "Technology - Programming",
+            "languages": ["English"],
+        },
+        {
+            "name": "SQL (New)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/sql-new/",
+            "description": "Evaluates SQL knowledge covering SELECT statements, JOINs, subqueries, aggregate functions, data manipulation, and database design concepts.",
+            "test_type": "K",
+            "test_type_full": "Knowledge & Skills",
+            "skills_measured": ["SQL queries", "JOINs", "Subqueries", "Aggregations", "Data manipulation", "Database design"],
+            "duration": "45 minutes",
+            "category": "Technology - Database",
+            "languages": ["English"],
+        },
+        {
+            "name": "JavaScript (New)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/javascript-new/",
+            "description": "Measures JavaScript proficiency including ES6+ features, DOM manipulation, asynchronous programming, closures, and modern JavaScript patterns.",
+            "test_type": "K",
+            "test_type_full": "Knowledge & Skills",
+            "skills_measured": ["JavaScript ES6+", "Async/await", "Closures", "DOM manipulation", "Promises", "Prototypes"],
+            "duration": "45 minutes",
+            "category": "Technology - Programming",
+            "languages": ["English"],
+        },
+        {
+            "name": "Microsoft Excel (Office 2019)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/ms-excel-2019/",
+            "description": "Assesses proficiency in Microsoft Excel 2019 including formulas, pivot tables, data analysis, charts, and advanced spreadsheet functions.",
+            "test_type": "K",
+            "test_type_full": "Knowledge & Skills",
+            "skills_measured": ["Excel formulas", "Pivot tables", "Data analysis", "Charts", "VLOOKUP", "Conditional formatting"],
+            "duration": "30 minutes",
+            "category": "Technology - Office",
+            "languages": ["English"],
+        },
+        {
+            "name": "Customer Service Phone Simulation",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/customer-service-phone-simulation/",
+            "description": "A realistic simulation measuring customer service skills in phone-based scenarios. Assesses active listening, problem resolution, empathy and communication.",
+            "test_type": "S",
+            "test_type_full": "Simulations",
+            "skills_measured": ["Customer service", "Active listening", "Problem resolution", "Empathy", "Communication"],
+            "duration": "20 minutes",
+            "category": "Customer Service",
+            "languages": ["English"],
+        },
+        {
+            "name": "Situational Judgement Test (Graduate)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/situational-judgement-test-graduate/",
+            "description": "Measures judgement and decision-making skills in workplace situations relevant to graduate-level roles. Assesses interpersonal skills, problem solving, and professional conduct.",
+            "test_type": "B",
+            "test_type_full": "Biodata & Situational Judgement",
+            "skills_measured": ["Judgement", "Decision making", "Interpersonal skills", "Problem solving", "Professional conduct"],
+            "duration": "25-35 minutes",
+            "category": "Judgement",
+            "languages": ["English"],
+        },
+        {
+            "name": "Sales Personality Questionnaire (SPSQ)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/sales-personality-questionnaire/",
+            "description": "Assesses personality characteristics critical to sales success including persistence, competitiveness, empathy, resilience and achievement orientation.",
+            "test_type": "P",
+            "test_type_full": "Personality & Behavior",
+            "skills_measured": ["Persistence", "Competitiveness", "Empathy", "Resilience", "Achievement drive", "Relationship building"],
+            "duration": "25 minutes",
+            "category": "Sales",
+            "languages": ["English"],
+        },
+        {
+            "name": "Occupational Safety Questionnaire",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/occupational-safety-questionnaire/",
+            "description": "Measures attitudes and behaviors relating to workplace safety including safety compliance, risk awareness, and safety-conscious behavior.",
+            "test_type": "P",
+            "test_type_full": "Personality & Behavior",
+            "skills_measured": ["Safety compliance", "Risk awareness", "Rule following", "Safety consciousness"],
+            "duration": "20 minutes",
+            "category": "Safety",
+            "languages": ["English"],
+        },
+        {
+            "name": "Universal Competency Framework (UCF)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/ucf/",
+            "description": "A comprehensive competency framework covering 20 competencies across 8 factors, enabling structured evaluation of key workplace competencies.",
+            "test_type": "C",
+            "test_type_full": "Competencies",
+            "skills_measured": ["Leadership", "Communication", "Achievement", "Relationships", "Analysis", "Creativity", "Planning", "Adaptability"],
+            "duration": "30-45 minutes",
+            "category": "Competency",
+            "languages": ["English", "French", "German"],
+        },
+        {
+            "name": "Deductive Reasoning Test",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/deductive-reasoning-test/",
+            "description": "Measures deductive reasoning by presenting logical arguments and asking candidates to evaluate the strength of conclusions drawn from premises.",
+            "test_type": "A",
+            "test_type_full": "Ability & Aptitude",
+            "skills_measured": ["Deductive reasoning", "Logical analysis", "Critical evaluation", "Argument assessment"],
+            "duration": "18 minutes",
+            "category": "Cognitive Ability",
+            "languages": ["English"],
+        },
+        {
+            "name": "General Ability Test - Verbal",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/general-ability-verbal/",
+            "description": "A short, adaptive verbal ability test measuring capacity to understand and use verbal information for higher-level cognitive processing tasks.",
+            "test_type": "A",
+            "test_type_full": "Ability & Aptitude",
+            "skills_measured": ["Verbal comprehension", "Vocabulary", "Language processing", "Reading ability"],
+            "duration": "10-15 minutes",
+            "category": "Cognitive Ability",
+            "languages": ["English"],
+        },
+        {
+            "name": "Graduate Managerial Assessment (GMA)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/graduate-managerial-assessment/",
+            "description": "Comprehensive graduate-level assessment combining numerical, verbal and inductive reasoning to evaluate managerial and professional potential.",
+            "test_type": "A",
+            "test_type_full": "Ability & Aptitude",
+            "skills_measured": ["Numerical reasoning", "Verbal reasoning", "Abstract reasoning", "Managerial potential"],
+            "duration": "36 minutes",
+            "category": "Cognitive Ability",
+            "languages": ["English"],
+        },
+        {
+            "name": "Leadership Report (OPQ)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/leadership-report/",
+            "description": "Uses OPQ data to assess leadership potential across 8 leadership dimensions including strategic thinking, inspiring others, and driving results.",
+            "test_type": "C",
+            "test_type_full": "Competencies",
+            "skills_measured": ["Strategic thinking", "Inspiring others", "Driving results", "Leading change", "Decision making", "Resilience"],
+            "duration": "25-35 minutes",
+            "category": "Leadership",
+            "languages": ["English", "French"],
+        },
+        {
+            "name": "Adaptive Employee Surveys",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/adaptive-employee-surveys/",
+            "description": "Measures employee engagement, wellbeing, and organizational health through adaptive survey methodology that personalizes questions based on responses.",
+            "test_type": "M",
+            "test_type_full": "Motivational",
+            "skills_measured": ["Employee engagement", "Wellbeing", "Organizational culture", "Team dynamics"],
+            "duration": "10-15 minutes",
+            "category": "Organizational Development",
+            "languages": ["English", "French", "German"],
+        },
+        {
+            "name": "C# (New)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/c-sharp-new/",
+            "description": "Evaluates C# programming skills including .NET framework, LINQ, async/await, object-oriented design patterns, and C# best practices.",
+            "test_type": "K",
+            "test_type_full": "Knowledge & Skills",
+            "skills_measured": ["C# OOP", ".NET framework", "LINQ", "Async programming", "Design patterns", "Exception handling"],
+            "duration": "45 minutes",
+            "category": "Technology - Programming",
+            "languages": ["English"],
+        },
+        {
+            "name": "Automata - Fix (Coding)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/automata-fix/",
+            "description": "A coding simulation where candidates debug and fix broken code. Evaluates practical debugging skills, code comprehension, and problem-solving ability.",
+            "test_type": "S",
+            "test_type_full": "Simulations",
+            "skills_measured": ["Debugging", "Code reading", "Problem solving", "Logical reasoning", "Software testing"],
+            "duration": "30 minutes",
+            "category": "Technology - Coding",
+            "languages": ["English"],
+        },
+        {
+            "name": "Mechanical Comprehension Test (MCT2)",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/mechanical-comprehension-test-2/",
+            "description": "Assesses understanding of mechanical principles and physical concepts relevant to technical and engineering roles.",
+            "test_type": "A",
+            "test_type_full": "Ability & Aptitude",
+            "skills_measured": ["Mechanical reasoning", "Physical principles", "Spatial awareness", "Technical comprehension"],
+            "duration": "20 minutes",
+            "category": "Technical",
+            "languages": ["English"],
+        },
+        {
+            "name": "Remote Work Personality Assessment",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/remote-work-personality/",
+            "description": "Evaluates personality traits critical for remote work success including self-management, digital communication, adaptability, and independence.",
+            "test_type": "P",
+            "test_type_full": "Personality & Behavior",
+            "skills_measured": ["Self-management", "Independence", "Digital communication", "Adaptability", "Accountability"],
+            "duration": "20 minutes",
+            "category": "Remote Work",
+            "languages": ["English"],
+        },
+        {
+            "name": "Data Entry Speed & Accuracy",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/data-entry-speed-and-accuracy/",
+            "description": "Measures speed and accuracy of data entry through realistic typing tasks. Suitable for administrative and clerical roles requiring high data accuracy.",
+            "test_type": "S",
+            "test_type_full": "Simulations",
+            "skills_measured": ["Typing speed", "Data accuracy", "Attention to detail", "Administrative skills"],
+            "duration": "15 minutes",
+            "category": "Administrative",
+            "languages": ["English"],
+        },
+        {
+            "name": "Business Analyst Simulation",
+            "url": "https://www.shl.com/solutions/products/product-catalog/view/business-analyst-simulation/",
+            "description": "A realistic simulation for business analyst roles measuring requirements gathering, data analysis, stakeholder communication, and solution design.",
+            "test_type": "S",
+            "test_type_full": "Simulations",
+            "skills_measured": ["Requirements analysis", "Data interpretation", "Stakeholder communication", "Problem solving", "Documentation"],
+            "duration": "45-60 minutes",
+            "category": "Business Analysis",
+            "languages": ["English"],
+        },
+    ]
+
+
+def run_scraper(use_fallback: bool = False) -> list[dict]:
+    """
+    Main scraper function.
+    Tries live scraping first; falls back to curated catalog if scraping fails.
+    """
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    if use_fallback:
+        log.info("Using fallback curated catalog")
+        catalog = get_fallback_catalog()
+    else:
+        log.info("Starting live SHL catalog scrape...")
+        with httpx.Client(timeout=30, follow_redirects=True) as client:
+            products = scrape_catalog_page(client)
+
+            if len(products) < 5:
+                log.warning("Live scraping returned too few results, using fallback catalog")
+                catalog = get_fallback_catalog()
+            else:
+                catalog = []
+                for i, product in enumerate(products):
+                    try:
+                        enriched = enrich_product(product, client)
+                        catalog.append(enriched)
+                        log.info(f"[{i+1}/{len(products)}] Done: {product['name']}")
+                    except Exception as e:
+                        log.error(f"Error enriching {product['name']}: {e}")
+                        catalog.append(product)
+
+    # Save to JSON
+    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
+        json.dump(catalog, f, indent=2, ensure_ascii=False)
+
+    log.info(f"Saved {len(catalog)} assessments to {OUTPUT_PATH}")
+    return catalog
+
+
+if __name__ == "__main__":
+    import sys
+    use_fallback = "--fallback" in sys.argv
+    run_scraper(use_fallback=use_fallback)
