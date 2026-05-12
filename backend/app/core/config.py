@@ -3,7 +3,7 @@ Application configuration using Pydantic Settings.
 Reads from environment variables or .env file.
 """
 
-from pydantic_settings import BaseSettings
+from pydantic import BaseSettings
 from pydantic import Field
 from typing import Literal, List
 import os
