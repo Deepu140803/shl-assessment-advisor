@@ -11,7 +11,7 @@ RUN npm ci --silent
 COPY . .
 
 # Build args for runtime environment injection
-ARG VITE_API_URL=http://localhost:8000
+ARG VITE_API_URL=https://exciting-blessing-production.up.railway.app
 ENV VITE_API_URL=$VITE_API_URL
 
 RUN npm run build
